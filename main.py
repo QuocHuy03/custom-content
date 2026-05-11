@@ -158,80 +158,111 @@ def _msg_text(msg: dict) -> tuple[str, bool]:
     return text, msg.get('status') == 'finished_successfully'
 
 
-def _sse(resp) -> str:
-    text, done, buf = '', False, ''
-    for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
-        if not chunk:
+def _sse(resp, on_delta=None) -> str:
+    """Parse SSE stream via iter_lines (no manual buffer splitting).
+    on_delta(delta: str) called with each new text fragment as it arrives.
+    """
+    text, done = '', False
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line or not raw_line.startswith('data:'):
             continue
-        buf += chunk
-        lines = buf.split('\n')
-        buf = lines[-1]
-        for line in lines[:-1]:
-            if not line.startswith('data:'):
-                continue
-            raw = line[5:].strip()
-            if not raw or raw == '[DONE]':
-                continue
-            try:
-                j = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(j, dict):
-                continue
+        raw = raw_line[5:].strip()
+        if not raw or raw == '[DONE]':
+            continue
+        try:
+            j = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(j, dict):
+            continue
 
-            err = j.get('error')
-            if err:
-                raise RuntimeError(err.get('message', str(err)) if isinstance(err, dict) else str(err))
+        err = j.get('error')
+        if err:
+            raise RuntimeError(err.get('message', str(err)) if isinstance(err, dict) else str(err))
 
-            p, o, v = j.get('p'), j.get('o'), j.get('v')
+        p, o, v = j.get('p'), j.get('o'), j.get('v')
+        prev = text
 
-            # direct message object
-            if isinstance(j.get('message'), dict):
-                t, fin = _msg_text(j['message'])
-                if t: text = t
-                if fin: done = True
+        # direct message object at top level
+        if isinstance(j.get('message'), dict):
+            t, fin = _msg_text(j['message'])
+            if t: text = t
+            if fin: done = True
 
-            # single patch op
-            if isinstance(p, str) and isinstance(o, str):
-                if p == '/message/content/parts/0':
-                    if o in ('append', 'add') and isinstance(v, str): text += v
-                    elif o == 'replace' and isinstance(v, str): text = v
-                if p == '/message/status' and o == 'replace' and v == 'finished_successfully':
-                    done = True
-
-            # root add/replace op wrapping a message
-            if o in ('add', 'replace') and isinstance(v, dict):
-                t, fin = _msg_text(v.get('message') or {})
-                if t: text = t
-                if fin: done = True
-
-            # v1 wrapper
-            if p is None and o is None and isinstance(v, dict):
-                t, fin = _msg_text(v.get('message') or {})
-                if t: text = t
-                if fin: done = True
-
-            # patch / array ops
-            ops = []
-            if o == 'patch' and isinstance(v, list): ops = v
-            elif p is None and o is None and isinstance(v, list): ops = v
-            for op in ops:
-                if not isinstance(op, dict): continue
-                op_p, op_o, op_v = op.get('p'), op.get('o'), op.get('v')
-                if op_p == '/message/content/parts/0':
-                    if op_o in ('append', 'add') and isinstance(op_v, str): text += op_v
-                    elif op_o == 'replace' and isinstance(op_v, str): text = op_v
-                if op_p == '/message/status' and op_o == 'replace' and op_v == 'finished_successfully':
-                    done = True
-
-            if j.get('type') == 'message_stream_complete':
+        # single patch op: p='/message/content/parts/0'
+        if isinstance(p, str) and isinstance(o, str):
+            if p == '/message/content/parts/0':
+                if o in ('append', 'add') and isinstance(v, str):
+                    text += v
+                elif o == 'replace' and isinstance(v, str):
+                    text = v
+            if p == '/message/status' and o == 'replace' and v == 'finished_successfully':
                 done = True
+
+        # root op wrapping a full message dict (e.g. o='add', p='')
+        if o in ('add',) and isinstance(v, dict) and p == '':
+            # only extract if it's an assistant message with actual content
+            t, fin = _msg_text(v.get('message') or {})
+            if t: text = t
+            if fin: done = True
+
+        # v1 wrapper: {v: {message: {...}}} with no p/o
+        if p is None and o is None and isinstance(v, dict):
+            t, fin = _msg_text(v.get('message') or {})
+            if t: text = t
+            if fin: done = True
+
+        # patch array: o='patch', v=[{op}, ...]
+        ops = []
+        if o == 'patch' and isinstance(v, list):
+            ops = v
+        elif p is None and o is None and isinstance(v, list):
+            ops = v
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            op_p, op_o, op_v = op.get('p'), op.get('o'), op.get('v')
+            if op_p == '/message/content/parts/0':
+                if op_o in ('append', 'add') and isinstance(op_v, str):
+                    text += op_v
+                elif op_o == 'replace' and isinstance(op_v, str):
+                    text = op_v
+            if op_p == '/message/status' and op_o == 'replace' and op_v == 'finished_successfully':
+                done = True
+
+        if j.get('type') == 'message_stream_complete':
+            done = True
+
+        # fire delta callback whenever text grew
+        if on_delta and text != prev:
+            delta = text[len(prev):]
+            if delta:
+                on_delta(delta)
+
         if done:
             break
+
     return text
 
 
-def ask(message: str) -> str:
+_CONV_BODY = {
+    'paragen_cot_summary_display_override': 'allow',
+    'parent_message_id': 'client-created-root',
+    'model': 'auto', 'timezone_offset_min': -420, 'timezone': 'Asia/Saigon',
+    'suggestions': [], 'history_and_training_disabled': True,
+    'conversation_mode': {'kind': 'primary_assistant'},
+    'system_hints': [], 'supports_buffering': True, 'supported_encodings': ['v1'],
+    'client_contextual_info': {
+        'is_dark_mode': True, 'time_since_loaded': 7,
+        'page_height': 911, 'page_width': 1080, 'pixel_ratio': 1,
+        'screen_height': 1080, 'screen_width': 1920, 'app_name': 'chatgpt.com',
+    },
+}
+
+
+def ask(message: str, on_delta=None) -> str:
+    """Call ChatGPT free. on_delta(str) receives text fragments as they stream."""
     sess = _session()
     ck = (f'__Host-next-auth.csrf-token={sess["csrf"]}; '
           f'oai-did={sess["did"]}; oai-nav-state=1; oai-sc={sess["sc"]};')
@@ -247,20 +278,12 @@ def ask(message: str) -> str:
                           'content': {'content_type': 'text', 'parts': [message]},
                           'metadata': {'serialization_metadata': {'custom_symbol_offsets': []},
                                        'dictation': False}}],
-            'paragen_cot_summary_display_override': 'allow',
-            'parent_message_id': 'client-created-root',
-            'model': 'auto', 'timezone_offset_min': -420, 'timezone': 'Asia/Saigon',
-            'suggestions': [], 'history_and_training_disabled': True,
-            'conversation_mode': {'kind': 'primary_assistant'},
-            'system_hints': [], 'supports_buffering': True, 'supported_encodings': ['v1'],
-            'client_contextual_info': {'is_dark_mode': True, 'time_since_loaded': 7,
-                'page_height': 911, 'page_width': 1080, 'pixel_ratio': 1,
-                'screen_height': 1080, 'screen_width': 1920, 'app_name': 'chatgpt.com'},
+            **_CONV_BODY,
         },
         stream=True, timeout=120)
     if not r.ok:
         raise RuntimeError(f'HTTP {r.status_code}: {r.text[:200]}')
-    text = _sse(r)
+    text = _sse(r, on_delta)
     if not text:
         raise RuntimeError('Empty response from ChatGPT')
     return text
@@ -574,6 +597,12 @@ class App(ctk.CTk):
             box.see('end')
         self.after(0, _do)
 
+    def _make_delta_cb(self, box):
+        """Return an on_delta callback that streams text into box in real time."""
+        def cb(delta: str):
+            self.after(0, lambda d=delta: (box.insert('end', d), box.see('end')))
+        return cb
+
     def _busy(self, on: bool):
         self.after(0, lambda: self._stop_btn.configure(
             state='normal' if on else 'disabled'))
@@ -680,13 +709,12 @@ class App(ctk.CTk):
                 self._st(f'Step 2 — "{name}" ({i+1}/{total})...')
                 self._pg(i / total)
                 try:
+                    self._append(self._refs_box, f'=== {name} ===\n')
                     ref = self._gen_char_ref(name)
                     self._char_refs[name] = ref
-                    self._append(self._refs_box,
-                                 f'=== {name} ===\n{ref}\n\n')
+                    self._append(self._refs_box, '\n\n')
                 except Exception as e:
-                    self._append(self._refs_box,
-                                 f'=== {name} ===\nError: {e}\n\n')
+                    self._append(self._refs_box, f'Error: {e}\n\n')
                 time.sleep(1.2)
             self._st(f'Step 2 done — {len(self._char_refs)} character refs ready. Now run Step 3.')
             self._pg(1.0)
@@ -731,11 +759,12 @@ class App(ctk.CTk):
             self._st(f'Step 2/3 — "{name}" ({i+1}/{total})...')
             self._pg(0.1 + 0.35 * (i / max(total, 1)))
             try:
+                self._append(self._refs_box, f'=== {name} ===\n')
                 ref = self._gen_char_ref(name)
                 self._char_refs[name] = ref
-                self._append(self._refs_box, f'=== {name} ===\n{ref}\n\n')
+                self._append(self._refs_box, '\n\n')
             except Exception as e:
-                self._append(self._refs_box, f'=== {name} ===\nError: {e}\n\n')
+                self._append(self._refs_box, f'Error: {e}\n\n')
             time.sleep(1.2)
 
         if self._stop.is_set():
@@ -762,7 +791,9 @@ class App(ctk.CTk):
             f'Story:\n{text}\n\n'
             'Character names:'
         )
-        result = ask(prompt)
+        # stream name list directly into names_box
+        cb = self._make_delta_cb(self._names_box)
+        result = ask(prompt, on_delta=cb)
         names = []
         for line in result.splitlines():
             name = line.strip().lstrip('•-–—*0123456789. ').strip()
@@ -776,22 +807,16 @@ class App(ctk.CTk):
             text = text[:10_000] + '\n...[truncated]'
         style = self._style()
         prompt = (
-            f'Based on the story text below, create a visual reference prompt '
-            f'for the character "{name}" suitable for image generation.\n\n'
+            f'Based on the story text below, create a concise visual reference prompt '
+            f'for image generation of the character "{name}".\n\n'
             f'Art style: {style}\n\n'
-            f'Include in the prompt:\n'
-            f'- Estimated age and gender\n'
-            f'- Hair color and style\n'
-            f'- Eye color\n'
-            f'- Clothing / outfit\n'
-            f'- Distinctive features or expression\n'
-            f'- Art style descriptor\n\n'
-            f'Format: a single comma-separated image generation prompt (2-3 lines max).\n'
-            f'Do NOT include character name in the prompt.\n\n'
-            f'Story text:\n{text}\n\n'
-            f'Visual reference prompt for {name}:'
+            f'Describe only: gender, age, hair, eyes, clothing, key features.\n'
+            f'Output: one comma-separated prompt, 1-2 lines, no intro text, no name.\n\n'
+            f'Story:\n{text}\n\n'
+            f'Prompt for {name}:'
         )
-        return ask(prompt)
+        cb = self._make_delta_cb(self._refs_box)
+        return ask(prompt, on_delta=cb)
 
     def _run_scene_prompts(self, scenes: list[tuple[int, str]],
                             p0: float, p1: float):
@@ -799,12 +824,11 @@ class App(ctk.CTk):
         batch = self._batch_n()
         total = len(scenes)
 
-        # Build character ref block
         char_block = ''
         if self._char_refs:
-            lines = [f'- {name}: {ref.splitlines()[0]}'
-                     for name, ref in self._char_refs.items()]
-            char_block = 'Character visual references:\n' + '\n'.join(lines) + '\n\n'
+            lines = [f'- {n}: {r.splitlines()[0]}'
+                     for n, r in self._char_refs.items()]
+            char_block = 'Character references:\n' + '\n'.join(lines) + '\n\n'
 
         for i in range(0, total, batch):
             if self._stop.is_set(): break
@@ -815,25 +839,22 @@ class App(ctk.CTk):
 
             scene_lines = '\n'.join(f'[{n}] {c}' for n, c in chunk)
             prompt = (
-                f'You are an expert image-prompt writer for anime/manhwa.\n'
                 f'Art style: {style}\n\n'
                 f'{char_block}'
-                f'For each numbered scene below, write one image-generation prompt in English.\n'
-                f'Rules:\n'
-                f'- Keep the exact scene number in brackets\n'
-                f'- 1-2 sentences: characters present, setting, action, mood, lighting\n'
-                f'- Reference character visuals from the list above when they appear\n'
-                f'- Embed the art style naturally\n'
-                f'- Output format strictly: [N] prompt text\n\n'
+                f'Write one image-generation prompt per scene. Rules:\n'
+                f'- Keep exact scene number in brackets: [N]\n'
+                f'- 1-2 sentences: characters, setting, action, mood, lighting\n'
+                f'- Use character references above when they appear in the scene\n'
+                f'- Output ONLY the prompts, no intro, no commentary\n'
+                f'- Format: [N] prompt text\n\n'
                 f'Scenes:\n{scene_lines}\n\n'
                 f'Prompts:'
             )
             try:
-                resp = ask(prompt)
-                parsed = re.findall(r'\[(\d+)\]\s*(.+?)(?=\n\[|\Z)', resp, re.DOTALL)
-                out = ''.join(f'[{n}] {pt.strip()}\n\n' for n, pt in parsed) if parsed \
-                      else resp.strip() + '\n\n'
-                self._append(self._prompts_box, out)
+                # stream raw into prompts box, then newline separator
+                cb = self._make_delta_cb(self._prompts_box)
+                resp = ask(prompt, on_delta=cb)
+                self._append(self._prompts_box, '\n')
             except Exception as e:
                 self._append(self._prompts_box, f'Error (scenes {n0}-{n1}): {e}\n\n')
             time.sleep(1.5)
