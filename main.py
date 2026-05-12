@@ -6,25 +6,33 @@ Pipeline: Script -> Names -> Character Refs -> Scene Prompts
 
 import sys, subprocess, ctypes
 
-for _pkg in ['requests', 'customtkinter', 'g4f[all]']:
-    try:
-        __import__(_pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
+if not getattr(sys, 'frozen', False):
+    for _pkg, _mod in [('requests','requests'), ('customtkinter','customtkinter'),
+                       ('curl_cffi','curl_cffi'), ('esprima','esprima'),
+                       ('pillow','PIL'), ('colorama','colorama')]:
+        try:
+            __import__(_mod)
+        except ImportError:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
 
-import re, json, time, uuid, threading
+import re, json, time, uuid, threading, webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import requests
 import customtkinter as ctk
 
+# ─── ChatGPT API server ───────────────────────────────────────────────────────
+_API_URL  = 'http://127.0.0.1:6969'
+_conv_id  = ''   # current ChatGPT conversation ID (auto-captured from server)
+
 # ─── Font ────────────────────────────────────────────────────────────────────
 
 def _load_font():
-    font_dir = Path(__file__).parent / 'fonts'
+    base = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else Path(__file__).parent
+    font_dir = base / 'fonts'
     font_dir.mkdir(exist_ok=True)
     needed = {
         'OpenSans-Regular.ttf': 'https://github.com/googlefonts/opensans/raw/main/fonts/ttf/OpenSans-Regular.ttf',
@@ -49,46 +57,33 @@ def _load_font():
     except Exception:
         pass
 
-_load_font()
+threading.Thread(target=_load_font, daemon=True).start()
 F = 'Open Sans'
 
-# ─── AI — gpt4free (no auth needed) ──────────────────────────────────────────
-# (provider_name, model_name) — each provider has its own accepted model name
-_PROVIDER_LIST = [
-    ('Yqcloud',        'gpt-4o-mini'),
-    ('PollinationsAI', 'openai-fast'),   # openai-fast = GPT-4o-mini on Pollinations
-    ('PollinationsAI', 'openai'),        # fallback to GPT-4o if fast not available
-]
-
+# ─── ChatGPT via local API server ─────────────────────────────────────────────
 
 def ask(message: str, on_delta=None) -> str:
-    from g4f.client import Client
-    from g4f import Provider
-
-    last_err: Exception | None = None
-    for pname, model in _PROVIDER_LIST:
-        if not hasattr(Provider, pname):
-            continue
-        try:
-            client = Client(provider=getattr(Provider, pname))
-            r = client.chat.completions.create(
-                model=model,
-                messages=[{'role': 'user', 'content': message}],
-                web_search=False,
-            )
-            text = r.choices[0].message.content or ''
-            if not text:
-                continue
-            if on_delta:
-                on_delta(text)
-            return text
-        except Exception as e:
-            last_err = e
-            s = str(e)
-            if '504' in s or 'RateLimit' in s or 'Timeout' in s or '429' in s:
-                time.sleep(4)
-            continue
-    raise RuntimeError(f'All providers failed: {last_err}')
+    global _conv_id
+    try:
+        resp = requests.post(
+            f'{_API_URL}/conversation',
+            json={'message': message},
+            timeout=180,
+        )
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(f'Không kết nối được API server tại {_API_URL}.\nChạy: python ChatGPT/api_server.py')
+    if resp.status_code != 200:
+        raise RuntimeError(f'API server lỗi {resp.status_code}: {resp.text[:200]}')
+    data = resp.json()
+    text = data.get('result', '').strip()
+    if not text:
+        raise RuntimeError('API server trả về rỗng.')
+    cid = data.get('conv_id') or ''
+    if cid:
+        _conv_id = cid
+    if on_delta:
+        on_delta(text)
+    return text
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -121,7 +116,7 @@ def _parse_scene_prompts(response: str) -> dict[int, str]:
                 current_parts = []
             continue
         # Match [N], [N], [N]: [N]. etc.
-        m = re.match(r'^\[(\d+)\][:\.\s]?\s*(.*)', line)
+        m = re.match(r'^\[?(\d+)\]?[:\.\s]\s*(.*)', line)
         if m:
             if current_num is not None and current_parts:
                 result[current_num] = ' '.join(current_parts)
@@ -155,6 +150,12 @@ STYLES: dict[str, str] = {
     'Manhwa Action':
         'Korean manhwa, dynamic fight poses, bold outlines, vibrant flats, impact speed lines',
 }
+
+CN_LANGS  = ['Tiếng Việt', 'English']
+CN_STYLES = ['anime', 'manhwa', 'realistic', 'cinematic',
+             'thumbnail YouTube', 'novel illustration',
+             'MAPPA Anime', 'ufotable', 'Solo Leveling']
+CN_MODELS = ['Flux', 'SDXL', 'Pony', 'Midjourney', 'Niji', 'ChatGPT image']
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -203,7 +204,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(p, text='Content AI',
                      font=ctk.CTkFont(family=F, size=20, weight='bold')).grid(
             row=0, column=0, padx=16, pady=(20, 2), sticky='ew')
-        ctk.CTkLabel(p, text='@huyit32  •  gpt4free',
+        ctk.CTkLabel(p, text='@huyit32  •  ChatGPT',
                      font=ctk.CTkFont(family=F, size=11), text_color='gray55').grid(
             row=1, column=0, padx=16, pady=(0, 12), sticky='ew')
 
@@ -290,19 +291,55 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=F, size=12),
             fg_color='#7a1515', hover_color='#4f0d0d',
             state='disabled', command=self._do_stop, corner_radius=6)
-        self._stop_btn.grid(row=19, column=0, padx=16, pady=(4, 8), sticky='ew')
+        self._stop_btn.grid(row=19, column=0, padx=16, pady=(4, 4), sticky='ew')
+
+        self._hr(p, 20)
+
+        ctk.CTkLabel(p, text='DICH TRUYEN CN',
+                     font=ctk.CTkFont(family=F, size=10, weight='bold'),
+                     text_color='gray50').grid(row=21, column=0, padx=16, pady=(8, 3), sticky='w')
+
+        ctk.CTkButton(p, text='Dich CN -> Prompt', height=36,
+                      font=ctk.CTkFont(family=F, size=12, weight='bold'),
+                      fg_color='#1a4f6a', hover_color='#0e3347',
+                      command=self._open_cn_tool, corner_radius=6).grid(
+            row=22, column=0, padx=16, pady=(0, 8), sticky='ew')
+
+        self._hr(p, 23)
 
         # API status + Settings button
         self._api_lbl = ctk.CTkLabel(
             p, text=self._api_status(),
             font=ctk.CTkFont(family=F, size=10), text_color='gray50')
-        self._api_lbl.grid(row=20, column=0, padx=16, pady=(0, 4), sticky='w')
+        self._api_lbl.grid(row=24, column=0, padx=16, pady=(8, 4), sticky='w')
 
-        ctk.CTkButton(p, text='⚙  Settings', height=28,
+        ctk.CTkButton(p, text='Settings', height=28,
                       font=ctk.CTkFont(family=F, size=11),
                       fg_color='#2a2a2a', hover_color='#3a3a3a',
                       command=self._open_settings, corner_radius=6).grid(
-            row=21, column=0, padx=16, pady=(0, 20), sticky='ew')
+            row=25, column=0, padx=16, pady=(0, 8), sticky='ew')
+
+        self._hr(p, 26)
+
+        self._conv_lbl = ctk.CTkLabel(
+            p, text='Chat: (chưa có)',
+            font=ctk.CTkFont(family=F, size=10), text_color='gray50',
+            anchor='w', wraplength=220)
+        self._conv_lbl.grid(row=27, column=0, padx=16, pady=(6, 3), sticky='ew')
+
+        cfr = ctk.CTkFrame(p, fg_color='transparent')
+        cfr.grid(row=28, column=0, padx=16, pady=(0, 16), sticky='ew')
+        cfr.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(cfr, text='Mở Chat', height=26,
+                      font=ctk.CTkFont(family=F, size=11),
+                      fg_color='#1a3a2a', hover_color='#0e2419',
+                      command=self._open_conv_browser, corner_radius=6).grid(
+            row=0, column=0, sticky='ew', padx=(0, 4))
+        ctk.CTkButton(cfr, text='Copy', width=46, height=26,
+                      font=ctk.CTkFont(family=F, size=11),
+                      fg_color='#2a2a2a', hover_color='#3a3a3a',
+                      command=self._copy_conv_id, corner_radius=6).grid(
+            row=0, column=1)
 
     def _main(self, p):
         # Status bar
@@ -387,25 +424,233 @@ class App(ctk.CTk):
 
     # ── Util ─────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _api_status() -> str:
-        return '● gpt4free — GPT-4o-mini'
+    def _refresh_conv_id(self):
+        def _do():
+            cid = _conv_id
+            if cid:
+                short = cid[:8] + '...' + cid[-4:]
+                self._conv_lbl.configure(text=f'Chat: {short}')
+            else:
+                self._conv_lbl.configure(text='Chat: (chưa có)')
+        self.after(0, _do)
+
+    def _open_conv_browser(self):
+        if _conv_id:
+            webbrowser.open(f'https://chatgpt.com/c/{_conv_id}')
+        else:
+            messagebox.showinfo('Chưa có', 'Chưa có conversation nào. Chạy pipeline trước.')
+
+    def _copy_conv_id(self):
+        if _conv_id:
+            self.clipboard_clear()
+            self.clipboard_append(f'https://chatgpt.com/c/{_conv_id}')
+            messagebox.showinfo('Copied', f'Đã copy link conversation!')
+        else:
+            messagebox.showinfo('Chưa có', 'Chưa có conversation nào.')
+
+    def _api_status(self) -> str:
+        try:
+            r = requests.get(f'{_API_URL}/health', timeout=2)
+            return '● ChatGPT server — online' if r.ok else '⚠ ChatGPT server — lỗi'
+        except Exception:
+            return '⚠ ChatGPT server — offline'
 
     def _open_settings(self):
         dlg = ctk.CTkToplevel(self)
         dlg.title('Settings')
-        dlg.geometry('420x200')
+        dlg.geometry('460x200')
         dlg.resizable(False, False)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text='Backend: gpt4free',
-                     font=ctk.CTkFont(family=F, size=14, weight='bold')).pack(pady=(24, 6))
-        ctk.CTkLabel(dlg, text='Model: GPT-4o-mini\nKhông cần đăng nhập hay cookie gì cả.',
-                     font=ctk.CTkFont(family=F, size=12), text_color='gray60',
-                     justify='center').pack(pady=4)
-        ctk.CTkButton(dlg, text='Đóng', height=34,
+        ctk.CTkLabel(dlg, text='ChatGPT API Server',
+                     font=ctk.CTkFont(family=F, size=14, weight='bold')).pack(pady=(18, 4))
+        ctk.CTkLabel(dlg,
+                     text=f'Chạy server: python ChatGPT/api_server.py\nĐịa chỉ mặc định: {_API_URL}',
+                     font=ctk.CTkFont(family=F, size=11), text_color='gray60',
+                     justify='center').pack(pady=(0, 12))
+
+        self._api_lbl.configure(text=self._api_status())
+
+        ctk.CTkButton(dlg, text='Kiểm tra kết nối', height=34,
                       font=ctk.CTkFont(family=F, size=12),
-                      command=dlg.destroy).pack(pady=(16, 0), padx=40, fill='x')
+                      command=lambda: (
+                          self._api_lbl.configure(text=self._api_status()),
+                          messagebox.showinfo('Status', self._api_status())
+                      )).pack(padx=16, fill='x')
+        ctk.CTkButton(dlg, text='Đóng', height=34, width=80,
+                      font=ctk.CTkFont(family=F, size=12),
+                      fg_color='#3a3a3a', hover_color='#555',
+                      command=dlg.destroy).pack(pady=(8, 16), padx=16, fill='x')
+
+    def _open_cn_tool(self):
+        win = ctk.CTkToplevel(self)
+        win.title('Dịch CN → Image Prompt')
+        win.geometry('1100x740')
+        win.resizable(True, True)
+
+        # ── Top controls ──────────────────────────────────────────────────────
+        ctrl = ctk.CTkFrame(win, fg_color='transparent')
+        ctrl.pack(fill='x', padx=14, pady=(12, 4))
+
+        ctk.CTkLabel(ctrl, text='Ngôn ngữ:',
+                     font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 4))
+        lang_var = ctk.StringVar(value=CN_LANGS[0])
+        ctk.CTkOptionMenu(ctrl, values=CN_LANGS, variable=lang_var, width=120, height=30,
+                          font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 12))
+
+        ctk.CTkLabel(ctrl, text='Style:',
+                     font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 4))
+        style_var = ctk.StringVar(value=CN_STYLES[0])
+        ctk.CTkOptionMenu(ctrl, values=CN_STYLES, variable=style_var, width=160, height=30,
+                          font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 12))
+
+        ctk.CTkLabel(ctrl, text='Model:',
+                     font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 4))
+        model_var = ctk.StringVar(value=CN_MODELS[0])
+        ctk.CTkOptionMenu(ctrl, values=CN_MODELS, variable=model_var, width=140, height=30,
+                          font=ctk.CTkFont(family=F, size=12)).pack(side='left', padx=(0, 16))
+
+        status_lbl = ctk.CTkLabel(ctrl, text='', font=ctk.CTkFont(family=F, size=11),
+                                   text_color='gray60')
+        status_lbl.pack(side='left', expand=True, fill='x')
+
+        process_btn = ctk.CTkButton(ctrl, text='Dịch & Gen Prompt', height=30, width=160,
+                                     font=ctk.CTkFont(family=F, size=12, weight='bold'),
+                                     fg_color='#1a4f6a', hover_color='#0e3347')
+        process_btn.pack(side='right', padx=(8, 0))
+
+        # ── Input ─────────────────────────────────────────────────────────────
+        ctk.CTkLabel(win, text='Nhập văn bản tiếng Trung:',
+                     font=ctk.CTkFont(family=F, size=11), text_color='gray60',
+                     anchor='w').pack(fill='x', padx=14, pady=(4, 2))
+        inp_box = ctk.CTkTextbox(win, height=130, font=ctk.CTkFont(family='Courier', size=12),
+                                  wrap='word')
+        inp_box.pack(fill='x', padx=14, pady=(0, 6))
+
+        # ── Table ─────────────────────────────────────────────────────────────
+        ctk.CTkLabel(win, text='Output:', font=ctk.CTkFont(family=F, size=11),
+                     text_color='gray60', anchor='w').pack(fill='x', padx=14, pady=(0, 2))
+
+        tbl_frame = ctk.CTkFrame(win)
+        tbl_frame.pack(fill='both', expand=True, padx=14, pady=(0, 4))
+
+        # Style Treeview for dark mode
+        tv_style = ttk.Style()
+        tv_style.theme_use('clam')
+        tv_style.configure('CN.Treeview',
+                            background='#1e1e1e', foreground='#e0e0e0',
+                            fieldbackground='#1e1e1e', rowheight=60,
+                            font=('Courier', 10))
+        tv_style.configure('CN.Treeview.Heading',
+                            background='#2a2a2a', foreground='#cccccc',
+                            font=(F, 11, 'bold'), relief='flat')
+        tv_style.map('CN.Treeview', background=[('selected', '#1a4f6a')])
+
+        tv = ttk.Treeview(tbl_frame, style='CN.Treeview',
+                          columns=('orig', 'trans', 'prompt'), show='headings')
+        tv.heading('orig',   text='Gốc (中文)')
+        tv.heading('trans',  text='Dịch')
+        tv.heading('prompt', text='Image Prompt')
+        tv.column('orig',   width=220, minwidth=120)
+        tv.column('trans',  width=240, minwidth=120)
+        tv.column('prompt', width=560, minwidth=200)
+
+        sb_y = ttk.Scrollbar(tbl_frame, orient='vertical',   command=tv.yview)
+        sb_x = ttk.Scrollbar(tbl_frame, orient='horizontal', command=tv.xview)
+        tv.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        sb_y.pack(side='right', fill='y')
+        sb_x.pack(side='bottom', fill='x')
+        tv.pack(fill='both', expand=True)
+
+        # ── Bottom toolbar ─────────────────────────────────────────────────────
+        bot = ctk.CTkFrame(win, fg_color='transparent')
+        bot.pack(fill='x', padx=14, pady=(4, 12))
+
+        def _copy_tsv():
+            rows = ['\t'.join(['Gốc', 'Dịch', 'Prompt'])]
+            for iid in tv.get_children():
+                rows.append('\t'.join(tv.item(iid, 'values')))
+            win.clipboard_clear(); win.clipboard_append('\n'.join(rows))
+            messagebox.showinfo('Copied', f'{len(rows)-1} dòng đã copy (TSV).')
+
+        def _save_tsv():
+            rows = ['\t'.join(['Gốc', 'Dịch', 'Prompt'])]
+            for iid in tv.get_children():
+                rows.append('\t'.join(tv.item(iid, 'values')))
+            if len(rows) <= 1:
+                messagebox.showwarning('Empty', 'Chưa có dữ liệu.'); return
+            p = filedialog.asksaveasfilename(defaultextension='.tsv',
+                                             filetypes=[('TSV', '*.tsv'), ('All', '*.*')])
+            if p:
+                Path(p).write_text('\n'.join(rows), encoding='utf-8')
+                messagebox.showinfo('Saved', f'Đã lưu {p}')
+
+        def _clear_table():
+            for iid in tv.get_children(): tv.delete(iid)
+            status_lbl.configure(text='')
+
+        for lbl, cmd in [('Copy TSV', _copy_tsv), ('Lưu TSV', _save_tsv), ('Xoá', _clear_table)]:
+            ctk.CTkButton(bot, text=lbl, height=28, width=100,
+                          font=ctk.CTkFont(family=F, size=11),
+                          command=cmd).pack(side='left', padx=3)
+
+        # ── Processing ────────────────────────────────────────────────────────
+        def _do_process():
+            cn_text = inp_box.get('1.0', 'end').strip()
+            if not cn_text:
+                messagebox.showwarning('Trống', 'Nhập văn bản tiếng Trung trước.'); return
+            _clear_table()
+            status_lbl.configure(text='Đang xử lý...')
+            process_btn.configure(state='disabled')
+
+            def _worker():
+                lang  = lang_var.get()
+                style = style_var.get()
+                model = model_var.get()
+                prompt = (
+                    f'You are a professional translator and image prompt writer.\n\n'
+                    f'Process the Chinese text below:\n'
+                    f'1. Split into individual sentences (1 sentence per row, max 2 if inseparable)\n'
+                    f'2. Translate each naturally to {lang}\n'
+                    f'3. Write an image generation prompt in {style} style, optimized for {model}\n'
+                    f'   — Keep character appearance/outfit consistent across all rows\n'
+                    f'   — Include: subject, setting, action, mood, lighting, camera angle\n\n'
+                    f'Output STRICTLY as tab-separated values, NO header, NO markdown:\n'
+                    f'CHINESE_SENTENCE<TAB>TRANSLATION<TAB>IMAGE_PROMPT\n\n'
+                    f'Rules: one row per sentence, prompt in English, no extra text.\n\n'
+                    f'Chinese text:\n{cn_text}'
+                )
+                try:
+                    result = ask(prompt)
+                    rows = []
+                    for line in result.splitlines():
+                        line = line.strip()
+                        if not line or line.count('\t') < 2:
+                            # Try pipe separator fallback
+                            parts = [p.strip() for p in line.split('|')]
+                            if len(parts) >= 3:
+                                rows.append(tuple(parts[:3]))
+                            continue
+                        parts = line.split('\t', 2)
+                        if len(parts) == 3:
+                            rows.append(tuple(parts))
+                    def _update():
+                        for row in rows:
+                            tv.insert('', 'end', values=row)
+                        n = len(rows)
+                        status_lbl.configure(text=f'Xong — {n} dòng.')
+                        process_btn.configure(state='normal')
+                    win.after(0, _update)
+                except Exception as e:
+                    win.after(0, lambda err=str(e): (
+                        status_lbl.configure(text=f'Lỗi: {err}'),
+                        process_btn.configure(state='normal'),
+                        messagebox.showerror('Lỗi', err),
+                    ))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        process_btn.configure(command=_do_process)
 
     @staticmethod
     def _hr(parent, row):
@@ -585,8 +830,10 @@ class App(ctk.CTk):
         except Exception as e:
             self._st(f'Error: {e}')
             self._append(self._names_box, f'Error: {e}\n')
+            self.after(0, lambda err=str(e): messagebox.showerror('Step 1 Error', err))
         finally:
             self._busy(False)
+            self._refresh_conv_id()
 
     def _t_step2(self):
         self._busy(True)
@@ -608,18 +855,26 @@ class App(ctk.CTk):
                     self._append(self._refs_box, '\n\n')
                 except Exception as e:
                     self._append(self._refs_box, f'Error: {e}\n\n')
+                    self.after(0, lambda err=str(e): messagebox.showerror('Step 2 Error', err))
                 time.sleep(0.5)
             self._st(f'Step 2 done — {len(self._char_refs)} refs ready. Now run Step 3.')
             self._pg(1.0)
         finally:
             self._busy(False)
+            self._refresh_conv_id()
 
     def _t_step3(self):
         self._busy(True)
         scenes = self._scenes
-        self._run_scene_prompts(scenes, p0=0.0, p1=1.0)
-        self._st(f'Step 3 done — {len(scenes)} scene prompts generated.')
-        self._busy(False)
+        try:
+            self._run_scene_prompts(scenes, p0=0.0, p1=1.0)
+            self._st(f'Step 3 done — {len(scenes)} scene prompts generated.')
+        except Exception as e:
+            self._st(f'Error: {e}')
+            self.after(0, lambda err=str(e): messagebox.showerror('Step 3 Error', err))
+        finally:
+            self._busy(False)
+            self._refresh_conv_id()
 
     def _t_all(self):
         self._busy(True)
@@ -676,6 +931,7 @@ class App(ctk.CTk):
         self._run_scene_prompts(self._scenes, p0=0.45, p1=1.0)
         self._st(f'All done — {len(self._scenes)} scenes processed.')
         self._busy(False)
+        self._refresh_conv_id()
 
     # ── AI calls ──────────────────────────────────────────────────────────────
 
@@ -694,8 +950,7 @@ class App(ctk.CTk):
             f'Story:\n{text}\n\n'
             'Characters:'
         )
-        cb = self._make_delta_cb(self._names_box)
-        result = ask(prompt, on_delta=cb)
+        result = ask(prompt)
         lines = []
         for line in result.splitlines():
             line = line.strip()
@@ -736,8 +991,9 @@ class App(ctk.CTk):
             f'Story:\n{text}\n\n'
             f'Prompt for {name}:'
         )
-        cb = self._make_delta_cb(self._refs_box)
-        return ask(prompt, on_delta=cb)
+        result = ask(prompt)
+        self._append(self._refs_box, result)
+        return result
 
     # 10 scenes per request — 20 caused truncation on free providers
     SCENES_PER_REQ = 10
@@ -777,7 +1033,9 @@ class App(ctk.CTk):
         batches = [scenes[i:i + self.SCENES_PER_REQ]
                    for i in range(0, total, self.SCENES_PER_REQ)]
         n_batches = len(batches)
-        workers = max(1, min(self._batch_n(), n_batches))
+        # Force sequential: API server serializes anyway, parallel workers just pile up
+        # requests in the queue and exhaust the rate limit faster.
+        workers = 1
 
         done_scenes = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -809,6 +1067,9 @@ class App(ctk.CTk):
                 done_scenes += len(batch)
                 self._st(f'Step 3 — {done_scenes}/{total} scenes done...')
                 self._pg(p0 + (p1 - p0) * (done_scenes / total))
+                # Brief pause between batches to avoid triggering ChatGPT rate limiting
+                if done_scenes < total and not self._stop.is_set():
+                    time.sleep(3)
 
         self._pg(p1)
 
