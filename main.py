@@ -6,14 +6,15 @@ Pipeline: Script -> Names -> Character Refs -> Scene Prompts
 
 import sys, subprocess, ctypes
 
-for _pkg in ['requests', 'customtkinter']:
+for _pkg in ['requests', 'customtkinter', 'g4f[all]']:
     try:
         __import__(_pkg)
     except ImportError:
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
 
-import re, json, time, uuid, random, base64, hashlib, threading
-from datetime import datetime, timezone
+import re, json, time, uuid, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -51,242 +52,43 @@ def _load_font():
 _load_font()
 F = 'Open Sans'
 
-# ─── ChatGPT Free ─────────────────────────────────────────────────────────────
-
-UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36')
-_csrf_cache: str | None = None
-
-
-def _rip() -> str:
-    return '.'.join(str(random.randint(0, 255)) for _ in range(4))
-
-
-def _hdrs(accept: str, did: str) -> dict:
-    ip = _rip()
-    return {
-        'accept': accept, 'Content-Type': 'application/json',
-        'cache-control': 'no-cache', 'Referer': 'https://chatgpt.com/',
-        'oai-device-id': did, 'oai-language': 'en', 'User-Agent': UA,
-        'pragma': 'no-cache', 'priority': 'u=1, i',
-        'sec-ch-ua': '"Not A(Brand";v="8","Chromium";v="132","Google Chrome";v="132"',
-        'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors',
-        'X-Forwarded-For': ip, 'X-Real-IP': ip,
-    }
-
-
-def _fake_tok() -> str:
-    cfg = [random.randint(3000, 6001),
-           datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT+0100 (Central European Time)'),
-           4294705152, 0, UA, 'de', 'de', 401,
-           'mediaSession', 'location', 'scrollX',
-           f'{random.uniform(1000, 5000):.4f}', str(uuid.uuid4()), '', 12,
-           int(time.time() * 1000)]
-    return 'gAAAAAC' + base64.b64encode(json.dumps(cfg).encode()).decode()
-
-
-def _pow(seed: str, diff: str) -> str:
-    cfg = [random.choice([8,12,16,24]) + random.choice([3000,4000,6000]),
-           datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT+0100 (Central European Time)'),
-           4294705152, 0, UA]
-    dl = len(diff) // 2
-    for i in range(100_000):
-        cfg[3] = i
-        b = base64.b64encode(json.dumps(cfg).encode()).decode()
-        if hashlib.new('sha3_512', (seed + b).encode()).hexdigest()[:dl] <= diff:
-            return 'gAAAAAB' + b
-    return 'gAAAAABwQ8Lk5' + base64.b64encode(f'"{seed}"'.encode()).decode()
-
-
-def _csrf(did: str) -> str:
-    global _csrf_cache
-    if _csrf_cache:
-        return _csrf_cache
-    r = requests.get('https://chatgpt.com/api/auth/csrf',
-                     headers=_hdrs('application/json', did), timeout=20)
-    t = r.json().get('csrfToken')
-    if not t:
-        raise RuntimeError('Cannot get CSRF')
-    _csrf_cache = t
-    return t
-
-
-def _sentinel(did: str, csrf: str) -> tuple[dict, str]:
-    ck = f'__Host-next-auth.csrf-token={csrf}; oai-did={did}; oai-nav-state=1;'
-    r = requests.post(
-        'https://chatgpt.com/backend-anon/sentinel/chat-requirements',
-        headers={**_hdrs('application/json', did), 'Cookie': ck},
-        json={'p': _fake_tok()}, timeout=20)
-    d = r.json()
-    sc = ''
-    for part in r.headers.get('set-cookie', '').split(';'):
-        if 'oai-sc=' in part:
-            sc = part.split('oai-sc=')[-1].strip()
-            break
-    return d, sc
-
-
-def _session() -> dict:
-    global _csrf_cache
-    did = str(uuid.uuid4())
-    csrf = _csrf(did)
-    d, sc = _sentinel(did, csrf)
-    if not isinstance(d, dict) or not d.get('token') or not d.get('proofofwork'):
-        _csrf_cache = None
-        csrf = _csrf(did)
-        d, sc = _sentinel(did, csrf)
-    if not isinstance(d, dict) or not d.get('token'):
-        raise RuntimeError('Cannot get sentinel token')
-    pw = d['proofofwork']
-    return {'did': did, 'csrf': csrf, 'sc': sc,
-            'token': d['token'], 'proof': _pow(pw['seed'], pw['difficulty'])}
-
-
-def _msg_text(msg: dict) -> tuple[str, bool]:
-    if not isinstance(msg, dict):
-        return '', False
-    if not (isinstance(msg.get('author'), dict) and
-            msg['author'].get('role') == 'assistant'):
-        return '', False
-    c = msg.get('content') or {}
-    text = ''
-    if isinstance(c, dict):
-        parts = c.get('parts', [])
-        if parts and isinstance(parts[0], str):
-            text = parts[0]
-    return text, msg.get('status') == 'finished_successfully'
-
-
-def _sse(resp, on_delta=None) -> str:
-    """Parse SSE stream via iter_lines (no manual buffer splitting).
-    on_delta(delta: str) called with each new text fragment as it arrives.
-    """
-    text, done = '', False
-
-    for raw_line in resp.iter_lines(decode_unicode=True):
-        if not raw_line or not raw_line.startswith('data:'):
-            continue
-        raw = raw_line[5:].strip()
-        if not raw or raw == '[DONE]':
-            continue
-        try:
-            j = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(j, dict):
-            continue
-
-        err = j.get('error')
-        if err:
-            raise RuntimeError(err.get('message', str(err)) if isinstance(err, dict) else str(err))
-
-        p, o, v = j.get('p'), j.get('o'), j.get('v')
-        prev = text
-
-        # direct message object at top level
-        if isinstance(j.get('message'), dict):
-            t, fin = _msg_text(j['message'])
-            if t: text = t
-            if fin: done = True
-
-        # single patch op: p='/message/content/parts/0'
-        if isinstance(p, str) and isinstance(o, str):
-            if p == '/message/content/parts/0':
-                if o in ('append', 'add') and isinstance(v, str):
-                    text += v
-                elif o == 'replace' and isinstance(v, str):
-                    text = v
-            if p == '/message/status' and o == 'replace' and v == 'finished_successfully':
-                done = True
-
-        # root op wrapping a full message dict (e.g. o='add', p='')
-        if o in ('add',) and isinstance(v, dict) and p == '':
-            # only extract if it's an assistant message with actual content
-            t, fin = _msg_text(v.get('message') or {})
-            if t: text = t
-            if fin: done = True
-
-        # v1 wrapper: {v: {message: {...}}} with no p/o
-        if p is None and o is None and isinstance(v, dict):
-            t, fin = _msg_text(v.get('message') or {})
-            if t: text = t
-            if fin: done = True
-
-        # patch array: o='patch', v=[{op}, ...]
-        ops = []
-        if o == 'patch' and isinstance(v, list):
-            ops = v
-        elif p is None and o is None and isinstance(v, list):
-            ops = v
-        for op in ops:
-            if not isinstance(op, dict):
-                continue
-            op_p, op_o, op_v = op.get('p'), op.get('o'), op.get('v')
-            if op_p == '/message/content/parts/0':
-                if op_o in ('append', 'add') and isinstance(op_v, str):
-                    text += op_v
-                elif op_o == 'replace' and isinstance(op_v, str):
-                    text = op_v
-            if op_p == '/message/status' and op_o == 'replace' and op_v == 'finished_successfully':
-                done = True
-
-        if j.get('type') == 'message_stream_complete':
-            done = True
-
-        # fire delta callback whenever text grew
-        if on_delta and text != prev:
-            delta = text[len(prev):]
-            if delta:
-                on_delta(delta)
-
-        if done:
-            break
-
-    return text
-
-
-_CONV_BODY = {
-    'paragen_cot_summary_display_override': 'allow',
-    'parent_message_id': 'client-created-root',
-    'model': 'auto', 'timezone_offset_min': -420, 'timezone': 'Asia/Saigon',
-    'suggestions': [], 'history_and_training_disabled': True,
-    'conversation_mode': {'kind': 'primary_assistant'},
-    'system_hints': [], 'supports_buffering': True, 'supported_encodings': ['v1'],
-    'client_contextual_info': {
-        'is_dark_mode': True, 'time_since_loaded': 7,
-        'page_height': 911, 'page_width': 1080, 'pixel_ratio': 1,
-        'screen_height': 1080, 'screen_width': 1920, 'app_name': 'chatgpt.com',
-    },
-}
+# ─── AI — gpt4free (no auth needed) ──────────────────────────────────────────
+# (provider_name, model_name) — each provider has its own accepted model name
+_PROVIDER_LIST = [
+    ('Yqcloud',        'gpt-4o-mini'),
+    ('PollinationsAI', 'openai-fast'),   # openai-fast = GPT-4o-mini on Pollinations
+    ('PollinationsAI', 'openai'),        # fallback to GPT-4o if fast not available
+]
 
 
 def ask(message: str, on_delta=None) -> str:
-    """Call ChatGPT free. on_delta(str) receives text fragments as they stream."""
-    sess = _session()
-    ck = (f'__Host-next-auth.csrf-token={sess["csrf"]}; '
-          f'oai-did={sess["did"]}; oai-nav-state=1; oai-sc={sess["sc"]};')
-    r = requests.post(
-        'https://chatgpt.com/backend-anon/conversation',
-        headers={**_hdrs('text/event-stream', sess['did']), 'Cookie': ck,
-                 'openai-sentinel-chat-requirements-token': sess['token'],
-                 'openai-sentinel-proof-token': sess['proof']},
-        json={
-            'action': 'next',
-            'messages': [{'id': str(uuid.uuid4()), 'author': {'role': 'user'},
-                          'create_time': int(time.time() * 1000),
-                          'content': {'content_type': 'text', 'parts': [message]},
-                          'metadata': {'serialization_metadata': {'custom_symbol_offsets': []},
-                                       'dictation': False}}],
-            **_CONV_BODY,
-        },
-        stream=True, timeout=120)
-    if not r.ok:
-        raise RuntimeError(f'HTTP {r.status_code}: {r.text[:200]}')
-    text = _sse(r, on_delta)
-    if not text:
-        raise RuntimeError('Empty response from ChatGPT')
-    return text
+    from g4f.client import Client
+    from g4f import Provider
+
+    last_err: Exception | None = None
+    for pname, model in _PROVIDER_LIST:
+        if not hasattr(Provider, pname):
+            continue
+        try:
+            client = Client(provider=getattr(Provider, pname))
+            r = client.chat.completions.create(
+                model=model,
+                messages=[{'role': 'user', 'content': message}],
+                web_search=False,
+            )
+            text = r.choices[0].message.content or ''
+            if not text:
+                continue
+            if on_delta:
+                on_delta(text)
+            return text
+        except Exception as e:
+            last_err = e
+            s = str(e)
+            if '504' in s or 'RateLimit' in s or 'Timeout' in s or '429' in s:
+                time.sleep(4)
+            continue
+    raise RuntimeError(f'All providers failed: {last_err}')
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -297,10 +99,42 @@ def parse_scenes(text: str) -> list[tuple[int, str]]:
         line = line.strip()
         if not line:
             continue
-        m = re.match(r'^(\d+)[_\.\s]\s*(.+)', line)
+        # Match: "123. text", "123 text", "123_ text", "[123] text", "[123]. text"
+        m = re.match(r'^\[?(\d+)\]?[_\.\s]\s*(.+)', line)
         if m:
             scenes.append((int(m.group(1)), m.group(2).strip()))
     return scenes
+
+
+def _parse_scene_prompts(response: str) -> dict[int, str]:
+    """Parse AI response into {scene_num: prompt_text}, handles multi-line and format quirks."""
+    result: dict[int, str] = {}
+    current_num: int | None = None
+    current_parts: list[str] = []
+
+    for line in response.splitlines():
+        line = line.strip()
+        if not line:
+            if current_num is not None and current_parts:
+                result[current_num] = ' '.join(current_parts)
+                current_num = None
+                current_parts = []
+            continue
+        # Match [N], [N], [N]: [N]. etc.
+        m = re.match(r'^\[(\d+)\][:\.\s]?\s*(.*)', line)
+        if m:
+            if current_num is not None and current_parts:
+                result[current_num] = ' '.join(current_parts)
+            current_num = int(m.group(1))
+            body = m.group(2).strip()
+            current_parts = [body] if body else []
+        elif current_num is not None:
+            current_parts.append(line)
+
+    if current_num is not None and current_parts:
+        result[current_num] = ' '.join(current_parts)
+
+    return result
 
 
 STYLES: dict[str, str] = {
@@ -337,7 +171,8 @@ class App(ctk.CTk):
         # State
         self._files:      list[tuple[Path, str]] = []
         self._scenes:     list[tuple[int, str]]  = []
-        self._names:      list[str]              = []   # extracted names
+        self._names:      list[str]              = []   # extracted names (clean, no ★)
+        self._main_chars: set[str]               = set()  # subset of _names that are main
         self._char_refs:  dict[str, str]         = {}   # name -> ref prompt
         self._stop        = threading.Event()
 
@@ -368,7 +203,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(p, text='Content AI',
                      font=ctk.CTkFont(family=F, size=20, weight='bold')).grid(
             row=0, column=0, padx=16, pady=(20, 2), sticky='ew')
-        ctk.CTkLabel(p, text='@huyit32  •  ChatGPT Free',
+        ctk.CTkLabel(p, text='@huyit32  •  gpt4free',
                      font=ctk.CTkFont(family=F, size=11), text_color='gray55').grid(
             row=1, column=0, padx=16, pady=(0, 12), sticky='ew')
 
@@ -423,11 +258,11 @@ class App(ctk.CTk):
         bfr = ctk.CTkFrame(p, fg_color='transparent')
         bfr.grid(row=12, column=0, padx=16, pady=4, sticky='ew')
         bfr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(bfr, text='Scenes per batch:',
+        ctk.CTkLabel(bfr, text='Parallel workers:',
                      font=ctk.CTkFont(family=F, size=11)).grid(row=0, column=0, sticky='w')
         self._batch = ctk.CTkEntry(bfr, width=52, height=28,
                                     font=ctk.CTkFont(family=F, size=12))
-        self._batch.insert(0, '8')
+        self._batch.insert(0, '5')
         self._batch.grid(row=0, column=1)
 
         self._hr(p, 13)
@@ -455,7 +290,19 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=F, size=12),
             fg_color='#7a1515', hover_color='#4f0d0d',
             state='disabled', command=self._do_stop, corner_radius=6)
-        self._stop_btn.grid(row=19, column=0, padx=16, pady=(4, 20), sticky='ew')
+        self._stop_btn.grid(row=19, column=0, padx=16, pady=(4, 8), sticky='ew')
+
+        # API status + Settings button
+        self._api_lbl = ctk.CTkLabel(
+            p, text=self._api_status(),
+            font=ctk.CTkFont(family=F, size=10), text_color='gray50')
+        self._api_lbl.grid(row=20, column=0, padx=16, pady=(0, 4), sticky='w')
+
+        ctk.CTkButton(p, text='⚙  Settings', height=28,
+                      font=ctk.CTkFont(family=F, size=11),
+                      fg_color='#2a2a2a', hover_color='#3a3a3a',
+                      command=self._open_settings, corner_radius=6).grid(
+            row=21, column=0, padx=16, pady=(0, 20), sticky='ew')
 
     def _main(self, p):
         # Status bar
@@ -488,7 +335,7 @@ class App(ctk.CTk):
         t1_inner.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(t1_inner,
-                     text='Extracted character names — one per line. Edit before Step 2.',
+                     text='★ = main character (detailed ref)  |  no ★ = supporting  |  Edit before Step 2.',
                      font=ctk.CTkFont(family=F, size=11), text_color='gray60',
                      anchor='w').grid(row=0, column=0, padx=6, pady=(6, 3), sticky='ew')
         self._names_box = ctk.CTkTextbox(t1_inner, font=ctk.CTkFont(family=F, size=13),
@@ -539,6 +386,26 @@ class App(ctk.CTk):
                           command=cmd).pack(side='left', padx=3)
 
     # ── Util ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _api_status() -> str:
+        return '● gpt4free — GPT-4o-mini'
+
+    def _open_settings(self):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title('Settings')
+        dlg.geometry('420x200')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text='Backend: gpt4free',
+                     font=ctk.CTkFont(family=F, size=14, weight='bold')).pack(pady=(24, 6))
+        ctk.CTkLabel(dlg, text='Model: GPT-4o-mini\nKhông cần đăng nhập hay cookie gì cả.',
+                     font=ctk.CTkFont(family=F, size=12), text_color='gray60',
+                     justify='center').pack(pady=4)
+        ctk.CTkButton(dlg, text='Đóng', height=34,
+                      font=ctk.CTkFont(family=F, size=12),
+                      command=dlg.destroy).pack(pady=(16, 0), padx=40, fill='x')
 
     @staticmethod
     def _hr(parent, row):
@@ -630,6 +497,7 @@ class App(ctk.CTk):
         for box in (self._names_box, self._refs_box, self._prompts_box):
             box.delete('1.0', 'end')
         self._char_refs.clear()
+        self._main_chars.clear()
         self._prog.set(0)
         self._st('Cleared.')
 
@@ -654,13 +522,29 @@ class App(ctk.CTk):
         self._names_box.delete('1.0', 'end')
         threading.Thread(target=self._t_step1, daemon=True).start()
 
+    def _parse_names_box(self):
+        """Parse names_box lines → update self._names and self._main_chars."""
+        raw = self._names_box.get('1.0', 'end').strip()
+        self._names = []
+        self._main_chars = set()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('★'):
+                name = line[1:].strip()
+                if name:
+                    self._names.append(name)
+                    self._main_chars.add(name)
+            else:
+                self._names.append(line)
+
     def _run_step2(self):
         if not self._guard(): return
-        names_raw = self._names_box.get('1.0', 'end').strip()
-        if not names_raw:
+        if not self._names_box.get('1.0', 'end').strip():
             messagebox.showwarning('No Names', 'Run Step 1 first, or type names manually.')
             return
-        self._names = [n.strip() for n in names_raw.splitlines() if n.strip()]
+        self._parse_names_box()
         self._refs_box.delete('1.0', 'end')
         self._char_refs.clear()
         threading.Thread(target=self._t_step2, daemon=True).start()
@@ -676,6 +560,7 @@ class App(ctk.CTk):
         self._refs_box.delete('1.0', 'end')
         self._prompts_box.delete('1.0', 'end')
         self._char_refs.clear()
+        self._main_chars.clear()
         threading.Thread(target=self._t_all, daemon=True).start()
 
     # ── Threads ───────────────────────────────────────────────────────────────
@@ -685,12 +570,17 @@ class App(ctk.CTk):
         self._st('Step 1 — Extracting character names...')
         self._pg(0.1)
         try:
-            names = self._extract_names()
+            lines = self._extract_names()  # returns display lines with ★ prefix
+            self._main_chars = {l[1:].strip() for l in lines if l.startswith('★')}
+            self._names = [l[1:].strip() if l.startswith('★') else l for l in lines]
+            display = '\n'.join(lines)
             self.after(0, lambda: (
                 self._names_box.delete('1.0', 'end'),
-                self._names_box.insert('1.0', '\n'.join(names))
+                self._names_box.insert('1.0', display)
             ))
-            self._st(f'Step 1 done — {len(names)} names found. Edit list, then run Step 2.')
+            main_n = len(self._main_chars)
+            total_n = len(self._names)
+            self._st(f'Step 1 done — {main_n} main + {total_n - main_n} supporting. Edit, then Step 2.')
             self._pg(1.0)
         except Exception as e:
             self._st(f'Error: {e}')
@@ -706,17 +596,20 @@ class App(ctk.CTk):
         try:
             for i, name in enumerate(self._names):
                 if self._stop.is_set(): break
-                self._st(f'Step 2 — "{name}" ({i+1}/{total})...')
+                is_main = name in self._main_chars
+                tag = '★ ' if is_main else ''
+                self._st(f'Step 2 — {tag}"{name}" ({i+1}/{total})...')
                 self._pg(i / total)
                 try:
-                    self._append(self._refs_box, f'=== {name} ===\n')
-                    ref = self._gen_char_ref(name)
+                    label = f'★ {name} [MAIN]' if is_main else name
+                    self._append(self._refs_box, f'=== {label} ===\n')
+                    ref = self._gen_char_ref(name, is_main=is_main)
                     self._char_refs[name] = ref
                     self._append(self._refs_box, '\n\n')
                 except Exception as e:
                     self._append(self._refs_box, f'Error: {e}\n\n')
-                time.sleep(1.2)
-            self._st(f'Step 2 done — {len(self._char_refs)} character refs ready. Now run Step 3.')
+                time.sleep(0.5)
+            self._st(f'Step 2 done — {len(self._char_refs)} refs ready. Now run Step 3.')
             self._pg(1.0)
         finally:
             self._busy(False)
@@ -735,13 +628,16 @@ class App(ctk.CTk):
         self._st('Step 1/3 — Extracting names...')
         self._pg(0.02)
         try:
-            names = self._extract_names()
-            self._names = names
+            lines = self._extract_names()
+            self._main_chars = {l[1:].strip() for l in lines if l.startswith('★')}
+            self._names = [l[1:].strip() if l.startswith('★') else l for l in lines]
+            display = '\n'.join(lines)
             self.after(0, lambda: (
                 self._names_box.delete('1.0', 'end'),
-                self._names_box.insert('1.0', '\n'.join(names))
+                self._names_box.insert('1.0', display)
             ))
-            self._st(f'Step 1 done — {len(names)} names.')
+            main_n = len(self._main_chars)
+            self._st(f'Step 1 done — {main_n} main + {len(self._names)-main_n} supporting.')
         except Exception as e:
             self._append(self._names_box, f'Error: {e}\n')
             self._names = []
@@ -756,16 +652,19 @@ class App(ctk.CTk):
         self._st(f'Step 2/3 — Generating {total} character refs...')
         for i, name in enumerate(self._names):
             if self._stop.is_set(): break
-            self._st(f'Step 2/3 — "{name}" ({i+1}/{total})...')
+            is_main = name in self._main_chars
+            tag = '★ ' if is_main else ''
+            self._st(f'Step 2/3 — {tag}"{name}" ({i+1}/{total})...')
             self._pg(0.1 + 0.35 * (i / max(total, 1)))
             try:
-                self._append(self._refs_box, f'=== {name} ===\n')
-                ref = self._gen_char_ref(name)
+                label = f'★ {name} [MAIN]' if is_main else name
+                self._append(self._refs_box, f'=== {label} ===\n')
+                ref = self._gen_char_ref(name, is_main=is_main)
                 self._char_refs[name] = ref
                 self._append(self._refs_box, '\n\n')
             except Exception as e:
                 self._append(self._refs_box, f'Error: {e}\n\n')
-            time.sleep(1.2)
+            time.sleep(0.5)
 
         if self._stop.is_set():
             self._st('Stopped.')
@@ -781,47 +680,92 @@ class App(ctk.CTk):
     # ── AI calls ──────────────────────────────────────────────────────────────
 
     def _extract_names(self) -> list[str]:
+        """Returns display lines: '★ Name' for main chars, 'Name' for supporting."""
         text = self._all_text()
-        if len(text) > 14_000:
-            text = text[:14_000] + '\n...[truncated]'
+        if len(text) > 5_000:
+            text = text[:5_000] + '\n...[truncated]'
         prompt = (
-            'Read the story text below and extract ALL named characters.\n'
-            'Output ONLY the character names, one name per line, nothing else.\n'
-            'No numbering, no descriptions, no punctuation — just names.\n\n'
+            'Read the story text below. Extract ALL named characters and identify '
+            'which are MAIN characters (appear frequently, drive the plot) vs SUPPORTING.\n\n'
+            'Output format — one name per line:\n'
+            '★ Name   (for main characters)\n'
+            'Name     (for supporting characters)\n\n'
+            'Rules: no numbering, no descriptions, no extra text — ONLY the lines above.\n\n'
             f'Story:\n{text}\n\n'
-            'Character names:'
+            'Characters:'
         )
-        # stream name list directly into names_box
         cb = self._make_delta_cb(self._names_box)
         result = ask(prompt, on_delta=cb)
-        names = []
+        lines = []
         for line in result.splitlines():
-            name = line.strip().lstrip('•-–—*0123456789. ').strip()
-            if name and len(name) > 1 and len(name) < 50:
-                names.append(name)
-        return names
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('★'):
+                name = line[1:].strip().lstrip('•-–—*0123456789. ').strip()
+                if name and 1 < len(name) < 50:
+                    lines.append(f'★ {name}')
+            else:
+                name = line.lstrip('•-–—*0123456789. ').strip()
+                if name and 1 < len(name) < 50:
+                    lines.append(name)
+        return lines
 
-    def _gen_char_ref(self, name: str) -> str:
+    def _gen_char_ref(self, name: str, is_main: bool = False) -> str:
         text = self._all_text()
-        if len(text) > 10_000:
-            text = text[:10_000] + '\n...[truncated]'
+        if len(text) > 4_000:
+            text = text[:4_000] + '\n...[truncated]'
         style = self._style()
+        if is_main:
+            detail = (
+                f'Describe in detail: gender, age range, hair (color/style), eyes, '
+                f'skin tone, clothing/outfit, weapons or items, body build, '
+                f'distinctive features, overall impression.\n'
+                f'Output: comma-separated prompt, 2-3 lines, no intro text, no name.'
+            )
+        else:
+            detail = (
+                f'Describe briefly: gender, age, hair, eyes, clothing, key features.\n'
+                f'Output: one comma-separated prompt, 1 line, no intro text, no name.'
+            )
         prompt = (
-            f'Based on the story text below, create a concise visual reference prompt '
+            f'Based on the story text below, create a visual reference prompt '
             f'for image generation of the character "{name}".\n\n'
             f'Art style: {style}\n\n'
-            f'Describe only: gender, age, hair, eyes, clothing, key features.\n'
-            f'Output: one comma-separated prompt, 1-2 lines, no intro text, no name.\n\n'
+            f'{detail}\n\n'
             f'Story:\n{text}\n\n'
             f'Prompt for {name}:'
         )
         cb = self._make_delta_cb(self._refs_box)
         return ask(prompt, on_delta=cb)
 
+    # 10 scenes per request — 20 caused truncation on free providers
+    SCENES_PER_REQ = 10
+
+    def _gen_scene_batch(self, chunk: list[tuple[int, str]], style: str,
+                          char_block: str) -> dict[int, str]:
+        scene_lines = '\n'.join(f'SCENE {n}: {d}' for n, d in chunk)
+        nums = [n for n, _ in chunk]
+        count = len(nums)
+        num_str = ', '.join(str(n) for n in nums)
+        prompt = (
+            f'Art style: {style}\n\n'
+            f'{char_block}'
+            f'Write exactly {count} image-generation prompts for scenes: {num_str}.\n'
+            f'You MUST output ALL {count} scenes. Do NOT skip any scene number.\n'
+            f'Output ONLY lines in this exact format — nothing else:\n'
+            f'[N] prompt text here\n\n'
+            f'Rules: N = scene number, one line per scene, no intro, no commentary. '
+            f'Each prompt: characters, setting, action, mood, lighting.\n\n'
+            f'Scenes:\n{scene_lines}\n\nPrompts:'
+        )
+        resp = ask(prompt)
+        parsed = _parse_scene_prompts(resp)
+        return parsed
+
     def _run_scene_prompts(self, scenes: list[tuple[int, str]],
                             p0: float, p1: float):
         style = self._style()
-        batch = self._batch_n()
         total = len(scenes)
 
         char_block = ''
@@ -830,34 +774,41 @@ class App(ctk.CTk):
                      for n, r in self._char_refs.items()]
             char_block = 'Character references:\n' + '\n'.join(lines) + '\n\n'
 
-        for i in range(0, total, batch):
-            if self._stop.is_set(): break
-            chunk = scenes[i:i+batch]
-            n0, n1 = chunk[0][0], chunk[-1][0]
-            self._st(f'Step 3 — Scenes {n0}-{n1} ({i+len(chunk)}/{total})...')
-            self._pg(p0 + (p1 - p0) * (i / total))
+        batches = [scenes[i:i + self.SCENES_PER_REQ]
+                   for i in range(0, total, self.SCENES_PER_REQ)]
+        n_batches = len(batches)
+        workers = max(1, min(self._batch_n(), n_batches))
 
-            scene_lines = '\n'.join(f'[{n}] {c}' for n, c in chunk)
-            prompt = (
-                f'Art style: {style}\n\n'
-                f'{char_block}'
-                f'Write one image-generation prompt per scene. Rules:\n'
-                f'- Keep exact scene number in brackets: [N]\n'
-                f'- 1-2 sentences: characters, setting, action, mood, lighting\n'
-                f'- Use character references above when they appear in the scene\n'
-                f'- Output ONLY the prompts, no intro, no commentary\n'
-                f'- Format: [N] prompt text\n\n'
-                f'Scenes:\n{scene_lines}\n\n'
-                f'Prompts:'
-            )
-            try:
-                # stream raw into prompts box, then newline separator
-                cb = self._make_delta_cb(self._prompts_box)
-                resp = ask(prompt, on_delta=cb)
-                self._append(self._prompts_box, '\n')
-            except Exception as e:
-                self._append(self._prompts_box, f'Error (scenes {n0}-{n1}): {e}\n\n')
-            time.sleep(1.5)
+        done_scenes = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_batch = {
+                pool.submit(self._gen_scene_batch, batch, style, char_block): batch
+                for batch in batches
+            }
+
+            for fut in as_completed(future_to_batch):
+                if self._stop.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                batch = future_to_batch[fut]
+                try:
+                    batch_results = fut.result()
+                    for n, _ in batch:
+                        if n not in batch_results:
+                            batch_results[n] = '[missing]'
+                except Exception as e:
+                    batch_results = {n: f'[error: {e}]' for n, _ in batch}
+
+                out = ''.join(
+                    f'[{n}] {batch_results[n]}\n'
+                    for n, _ in sorted(batch, key=lambda x: x[0])
+                )
+                if out:
+                    self._append(self._prompts_box, out)
+
+                done_scenes += len(batch)
+                self._st(f'Step 3 — {done_scenes}/{total} scenes done...')
+                self._pg(p0 + (p1 - p0) * (done_scenes / total))
 
         self._pg(p1)
 
