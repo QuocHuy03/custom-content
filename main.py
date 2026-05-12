@@ -15,7 +15,7 @@ if not getattr(sys, 'frozen', False):
         except ImportError:
             subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
 
-import re, json, time, uuid, threading, webbrowser
+import re, json, time, uuid, threading, webbrowser, itertools, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +24,80 @@ from tkinter import filedialog, messagebox, ttk
 import requests
 import customtkinter as ctk
 
-# ─── ChatGPT API server ───────────────────────────────────────────────────────
-_API_URL  = 'http://127.0.0.1:6969'
-_conv_id  = ''   # current ChatGPT conversation ID (auto-captured from server)
+# ─── ChatGPT API server pool ─────────────────────────────────────────────────
+_API_URL  = 'http://127.0.0.1:6969'   # primary (kept for compat)
+_conv_id  = ''                         # conversation ID (auto-captured)
+
+def _discover_servers(base_port: int = 6969, count: int = 8) -> list[str]:
+    """Probe ports base_port..base_port+count-1, return URLs that respond /health."""
+    found = []
+    for port in range(base_port, base_port + count):
+        try:
+            r = requests.get(f'http://127.0.0.1:{port}/health', timeout=1)
+            if r.ok:
+                found.append(f'http://127.0.0.1:{port}')
+        except Exception:
+            pass
+    return found or [f'http://127.0.0.1:{base_port}']
+
+_api_pool:    list[str]       = []   # populated on first use
+_api_cycle:   itertools.cycle = None
+_api_lock     = threading.Lock()
+_server_procs: list           = []   # launched subprocesses
+
+_SERVER_SCRIPT = Path(__file__).parent / 'ChatGPT' / 'api_server.py'
+
+
+def _find_cookie_files() -> list:
+    """Read cookie.txt — each non-empty line = one account's cookie string.
+    Falls back to a single None entry (manual login) if no file found."""
+    cookie_txt = Path(__file__).parent / 'ChatGPT' / 'cookie.txt'
+    if cookie_txt.exists():
+        lines = [l.strip() for l in cookie_txt.read_text('utf-8').splitlines() if l.strip()]
+        if lines:
+            return lines  # list of cookie strings, one per account
+    return [None]  # no cookie file → manual login
+
+
+def _kill_port(port: int):
+    try:
+        out = subprocess.check_output(['netstat', '-ano'], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if f':{port} ' in line and 'LISTENING' in line:
+                pid = int(line.split()[-1])
+                subprocess.run(['taskkill', '/PID', str(pid), '/F'],
+                               capture_output=True)
+                break
+    except Exception:
+        pass
+
+
+def _launch_servers(accounts: list) -> list[int]:
+    """Launch one api_server per account. accounts = list of cookie strings (or None)."""
+    global _server_procs, _api_pool, _api_cycle
+    ports = []
+    for i, cookie_str in enumerate(accounts):
+        port = 6969 + i
+        _kill_port(port)
+        env = os.environ.copy()
+        env['PORT'] = str(port)
+        if cookie_str is not None:
+            env['COOKIE_STRING'] = cookie_str
+        proc = subprocess.Popen([sys.executable, str(_SERVER_SCRIPT)], env=env)
+        _server_procs.append(proc)
+        ports.append(port)
+    _api_pool  = [f'http://127.0.0.1:{p}' for p in ports]
+    _api_cycle = itertools.cycle(_api_pool)
+    return ports
+
+
+def _cleanup_servers():
+    for proc in _server_procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
 
 # ─── Font ────────────────────────────────────────────────────────────────────
 
@@ -62,16 +133,26 @@ F = 'Open Sans'
 
 # ─── ChatGPT via local API server ─────────────────────────────────────────────
 
+def _next_server() -> str:
+    global _api_pool, _api_cycle
+    with _api_lock:
+        if not _api_pool:
+            _api_pool  = _discover_servers()
+            _api_cycle = itertools.cycle(_api_pool)
+            print(f'[pool] {len(_api_pool)} server(s): {_api_pool}', flush=True)
+        return next(_api_cycle)
+
 def ask(message: str, on_delta=None) -> str:
     global _conv_id
+    url = _next_server()
     try:
         resp = requests.post(
-            f'{_API_URL}/conversation',
+            f'{url}/conversation',
             json={'message': message},
             timeout=180,
         )
     except requests.exceptions.ConnectionError:
-        raise RuntimeError(f'Không kết nối được API server tại {_API_URL}.\nChạy: python ChatGPT/api_server.py')
+        raise RuntimeError(f'Không kết nối được API server tại {url}.\nChạy: python ChatGPT/api_server.py')
     if resp.status_code != 200:
         raise RuntimeError(f'API server lỗi {resp.status_code}: {resp.text[:200]}')
     data = resp.json()
@@ -178,6 +259,66 @@ class App(ctk.CTk):
         self._stop        = threading.Event()
 
         self._build()
+        self._launch_and_wait()
+
+    # ── Startup overlay ───────────────────────────────────────────────────────
+
+    def _launch_and_wait(self):
+        cookie_files = _find_cookie_files()
+        ports        = _launch_servers(cookie_files)
+
+        # Full-screen loading overlay — sits on top of the built UI
+        ov = ctk.CTkFrame(self, fg_color='#111111', corner_radius=0)
+        ov.place(x=0, y=0, relwidth=1, relheight=1)
+        ov.lift()
+
+        ctk.CTkLabel(ov, text='Content AI',
+                     font=ctk.CTkFont(family=F, size=36, weight='bold')).pack(pady=(100, 6))
+        ctk.CTkLabel(ov, text='@huyit32',
+                     font=ctk.CTkFont(family=F, size=12), text_color='gray45').pack(pady=(0, 40))
+
+        acc_labels: dict[int, ctk.CTkLabel] = {}
+        for i, port in enumerate(ports):
+            lbl = ctk.CTkLabel(
+                ov,
+                text=f'  Account {i+1}  —  ⏳ Đang mở Chrome...',
+                font=ctk.CTkFont(family=F, size=13),
+                text_color='gray55', anchor='w')
+            lbl.pack(fill='x', padx=120, pady=4)
+            acc_labels[port] = lbl
+
+        dot = [0]
+
+        def _poll():
+            all_ok = True
+            for port in ports:
+                lbl = acc_labels[port]
+                i   = ports.index(port)
+                try:
+                    r  = requests.get(f'http://127.0.0.1:{port}/health', timeout=0.8)
+                    ok = r.ok
+                except Exception:
+                    ok = False
+
+                if ok:
+                    lbl.configure(
+                        text=f'  Account {i+1}  —  ✓ Sẵn sàng',
+                        text_color='#4caf50')
+                else:
+                    all_ok = False
+                    dots   = '.' * (dot[0] % 4)
+                    lbl.configure(
+                        text=f'  Account {i+1}  —  ⏳ Đang khởi động{dots}',
+                        text_color='gray55')
+
+            dot[0] += 1
+            if all_ok:
+                self._refresh_conv_id()
+                self.after(400, ov.destroy)
+            else:
+                self.after(1000, _poll)
+
+        self.after(800, _poll)
 
     # ── Layout ───────────────────────────────────────────────────────────────
 
@@ -1033,9 +1174,8 @@ class App(ctk.CTk):
         batches = [scenes[i:i + self.SCENES_PER_REQ]
                    for i in range(0, total, self.SCENES_PER_REQ)]
         n_batches = len(batches)
-        # Force sequential: API server serializes anyway, parallel workers just pile up
-        # requests in the queue and exhaust the rate limit faster.
-        workers = 1
+        # workers = number of live servers; each server handles 1 request at a time
+        workers = max(1, len(_api_pool) if _api_pool else 1)
 
         done_scenes = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1078,4 +1218,5 @@ class App(ctk.CTk):
 
 if __name__ == '__main__':
     app = App()
+    app.protocol('WM_DELETE_WINDOW', lambda: (_cleanup_servers(), app.destroy()))
     app.mainloop()
