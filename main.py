@@ -4,18 +4,26 @@ Content AI - @huyit32
 Pipeline: Script -> Names -> Character Refs -> Scene Prompts
 """
 
-import sys, subprocess, ctypes
+import sys, subprocess, ctypes, os
+
+# Server mode: frozen exe re-launched as API server subprocess
+if '--server' in sys.argv:
+    # --noconsole sets stdout/stderr to None; uvicorn logging calls .isatty() on them
+    if sys.stdout is None: sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None: sys.stderr = open(os.devnull, 'w')
+    from api_server import app as _fastapi_app
+    import uvicorn
+    uvicorn.run(_fastapi_app, host='0.0.0.0', port=int(os.environ.get('PORT', 6969)))
+    sys.exit(0)
 
 if not getattr(sys, 'frozen', False):
-    for _pkg, _mod in [('requests','requests'), ('customtkinter','customtkinter'),
-                       ('curl_cffi','curl_cffi'), ('esprima','esprima'),
-                       ('pillow','PIL'), ('colorama','colorama')]:
+    for _pkg, _mod in [('requests','requests'), ('customtkinter','customtkinter')]:
         try:
             __import__(_mod)
         except ImportError:
             subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
 
-import re, json, time, uuid, threading, webbrowser, itertools, os
+import re, json, time, uuid, threading, webbrowser, itertools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -45,17 +53,19 @@ _api_cycle:   itertools.cycle = None
 _api_lock     = threading.Lock()
 _server_procs: list           = []   # launched subprocesses
 
-_SERVER_SCRIPT = Path(__file__).parent / 'ChatGPT' / 'api_server.py'
+_SERVER_SCRIPT = Path(__file__).parent / 'api_server.py'
 
 
 def _find_cookie_files() -> list:
-    """Read cookie.txt — each non-empty line = one account's cookie string.
-    Falls back to a single None entry (manual login) if no file found."""
-    cookie_txt = Path(__file__).parent / 'ChatGPT' / 'cookie.txt'
-    if cookie_txt.exists():
-        lines = [l.strip() for l in cookie_txt.read_text('utf-8').splitlines() if l.strip()]
-        if lines:
-            return lines  # list of cookie strings, one per account
+    """Read chatgpt_cookie.txt or cookie.txt next to the exe/script.
+    Each non-empty line = one account's cookie string."""
+    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    for fname in ('chatgpt_cookie.txt', 'cookie.txt'):
+        p = base / fname
+        if p.exists():
+            lines = [l.strip() for l in p.read_text('utf-8').splitlines() if l.strip()]
+            if lines:
+                return lines
     return [None]  # no cookie file → manual login
 
 
@@ -83,7 +93,9 @@ def _launch_servers(accounts: list) -> list[int]:
         env['PORT'] = str(port)
         if cookie_str is not None:
             env['COOKIE_STRING'] = cookie_str
-        proc = subprocess.Popen([sys.executable, str(_SERVER_SCRIPT)], env=env)
+        # Frozen: re-launch this exe with --server flag; else call api_server.py directly
+        cmd = [sys.executable, '--server'] if getattr(sys, 'frozen', False) else [sys.executable, str(_SERVER_SCRIPT)]
+        proc = subprocess.Popen(cmd, env=env)
         _server_procs.append(proc)
         ports.append(port)
     _api_pool  = [f'http://127.0.0.1:{p}' for p in ports]
@@ -997,7 +1009,7 @@ class App(ctk.CTk):
                 except Exception as e:
                     self._append(self._refs_box, f'Error: {e}\n\n')
                     self.after(0, lambda err=str(e): messagebox.showerror('Step 2 Error', err))
-                time.sleep(0.5)
+                time.sleep(0.1)
             self._st(f'Step 2 done — {len(self._char_refs)} refs ready. Now run Step 3.')
             self._pg(1.0)
         finally:
@@ -1209,7 +1221,7 @@ class App(ctk.CTk):
                 self._pg(p0 + (p1 - p0) * (done_scenes / total))
                 # Brief pause between batches to avoid triggering ChatGPT rate limiting
                 if done_scenes < total and not self._stop.is_set():
-                    time.sleep(3)
+                    time.sleep(1)
 
         self._pg(p1)
 

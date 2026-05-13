@@ -1,0 +1,7 @@
+requests
+customtkinter
+fastapi
+uvicorn[standard]
+pydantic
+seleniumbase
+pyinstaller
