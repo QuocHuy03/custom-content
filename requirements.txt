@@ -1,7 +1,8 @@
 requests
-customtkinter
+PyQt5
 fastapi
 uvicorn[standard]
 pydantic
-seleniumbase
 pyinstaller
+curl_cffi
+python-dotenv
