@@ -20,7 +20,6 @@ if not getattr(sys, 'frozen', False):
             subprocess.check_call([sys.executable, '-m', 'pip', 'install', _pkg])
 
 import re, time, threading, webbrowser, itertools, winreg
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -227,6 +226,26 @@ def _parse_scene_prompts(response):
     if current_num is not None and current_parts:
         result[current_num] = ' '.join(current_parts)
     return result
+
+
+def _parse_char_refs_bulk(response):
+    refs = {}
+    current = None
+    buf = []
+    for line in response.splitlines():
+        s = line.strip()
+        m = re.match(r'^===\s*(.+?)\s*===\s*$', s)
+        if m:
+            if current is not None and buf:
+                refs[current] = ' '.join(buf)
+            raw = m.group(1).replace('[MAIN]', '').replace('★', '').strip()
+            current = raw
+            buf = []
+        elif s and current is not None:
+            buf.append(s)
+    if current is not None and buf:
+        refs[current] = ' '.join(buf)
+    return refs
 
 
 STYLES = {
@@ -847,25 +866,24 @@ class App(QMainWindow):
     def _t_step2(self):
         self._busy(True)
         total = len(self._names)
-        self._st(f'Step 2 — Generating references for {total} characters...')
-        self._pg(0.0)
+        self._st(f'Step 2 — Generating refs for {total} characters in 1 request...')
+        self._pg(0.1)
         try:
-            for i, name in enumerate(self._names):
+            raw = self._gen_all_char_refs()
+            refs = _parse_char_refs_bulk(raw)
+            for name in self._names:
                 if self._stop.is_set(): break
                 is_main = name in self._main_chars
-                self._st(f'Step 2 — {"★ " if is_main else ""}"{name}" ({i+1}/{total})...')
-                self._pg(i / total)
-                try:
-                    label = f'★ {name} [MAIN]' if is_main else name
-                    self._append(self._refs_box, f'=== {label} ===\n')
-                    ref = self._gen_char_ref(name, is_main=is_main)
-                    self._char_refs[name] = ref
-                    self._append(self._refs_box, '\n\n')
-                except Exception as e:
-                    self._append(self._refs_box, f'Error: {e}\n\n')
-                time.sleep(0.1)
+                label = f'★ {name} [MAIN]' if is_main else name
+                self._append(self._refs_box, f'=== {label} ===\n')
+                ref = refs.get(name, '[not found]')
+                self._char_refs[name] = ref
+                self._append(self._refs_box, ref + '\n\n')
             self._st(f'Step 2 done — {len(self._char_refs)} refs ready.')
             self._pg(1.0)
+        except Exception as e:
+            self._st(f'Error: {e}')
+            self._append(self._refs_box, f'Error: {e}\n')
         finally:
             self._busy(False)
             self._sigs.conv.emit()
@@ -899,20 +917,22 @@ class App(QMainWindow):
             self._st('Stopped.'); self._busy(False); return
 
         total = len(self._names)
-        self._st(f'Step 2/3 — Generating {total} character refs...')
-        for i, name in enumerate(self._names):
-            if self._stop.is_set(): break
-            is_main = name in self._main_chars
-            self._st(f'Step 2/3 — {"★ " if is_main else ""}"{name}" ({i+1}/{total})...')
-            self._pg(0.1 + 0.35 * (i / max(total, 1)))
-            try:
-                self._append(self._refs_box, f'=== {"★ "+name+" [MAIN]" if is_main else name} ===\n')
-                ref = self._gen_char_ref(name, is_main=is_main)
+        self._st(f'Step 2/3 — Generating refs for {total} characters in 1 request...')
+        self._pg(0.12)
+        try:
+            raw = self._gen_all_char_refs()
+            refs = _parse_char_refs_bulk(raw)
+            for name in self._names:
+                if self._stop.is_set(): break
+                is_main = name in self._main_chars
+                label = f'★ {name} [MAIN]' if is_main else name
+                self._append(self._refs_box, f'=== {label} ===\n')
+                ref = refs.get(name, '[not found]')
                 self._char_refs[name] = ref
-                self._append(self._refs_box, '\n\n')
-            except Exception as e:
-                self._append(self._refs_box, f'Error: {e}\n\n')
-            time.sleep(0.5)
+                self._append(self._refs_box, ref + '\n\n')
+            self._pg(0.45)
+        except Exception as e:
+            self._append(self._refs_box, f'Error: {e}\n\n')
 
         if self._stop.is_set():
             self._st('Stopped.'); self._busy(False); return
@@ -953,34 +973,32 @@ class App(QMainWindow):
                     lines.append(name)
         return lines
 
-    def _gen_char_ref(self, name, is_main=False):
+    def _gen_all_char_refs(self):
         text = self._all_text()
         if len(text) > 4_000:
             text = text[:4_000] + '\n...[truncated]'
-        style  = self._style()
-        detail = (
-            'Describe in detail: gender, age range, hair (color/style), eyes, skin tone, '
-            'clothing/outfit, weapons or items, body build, distinctive features.\n'
-            'Output: comma-separated prompt, 2-3 lines, no intro text, no name.'
-            if is_main else
-            'Describe briefly: gender, age, hair, eyes, clothing, key features.\n'
-            'Output: one comma-separated prompt, 1 line, no intro text, no name.'
+        style = self._style()
+        char_list = '\n'.join(
+            f'★ {n} [MAIN]' if n in self._main_chars else n
+            for n in self._names
         )
         prompt = (
-            f'Based on the story text below, create a visual reference prompt '
-            f'for image generation of the character "{name}".\n\n'
-            f'Art style: {style}\n\n{detail}\n\n'
-            f'Story:\n{text}\n\nPrompt for {name}:'
+            f'Art style: {style}\n\n'
+            f'Based on the story text, create visual reference prompts for image generation for each character.\n\n'
+            f'★ MAIN characters: gender, age range, hair (color/style), eyes, skin tone, '
+            f'clothing/outfit, weapons or items, body build, distinctive features — 2-3 comma-separated lines.\n'
+            f'Supporting characters: gender, age, hair, eyes, clothing, key features — 1 comma-separated line.\n\n'
+            f'Output ONLY in this exact format, no extra text:\n'
+            f'=== CharacterName ===\n'
+            f'description\n\n'
+            f'Characters:\n{char_list}\n\n'
+            f'Story:\n{text}\n\nRefs:'
         )
-        result = ask(prompt)
-        self._append(self._refs_box, result)
-        return result
+        return ask(prompt)
 
-    SCENES_PER_REQ = 10
-
-    def _gen_scene_batch(self, chunk, style, char_block):
-        scene_lines = '\n'.join(f'SCENE {n}: {d}' for n, d in chunk)
-        nums  = [n for n, _ in chunk]
+    def _gen_scene_batch(self, scenes, style, char_block):
+        scene_lines = '\n'.join(f'SCENE {n}: {d}' for n, d in scenes)
+        nums  = [n for n, _ in scenes]
         count = len(nums)
         prompt = (
             f'Art style: {style}\n\n{char_block}'
@@ -1002,34 +1020,20 @@ class App(QMainWindow):
             lines = [f'- {n}: {r.splitlines()[0]}' for n, r in self._char_refs.items()]
             char_block = 'Character references:\n' + '\n'.join(lines) + '\n\n'
 
-        batches  = [scenes[i:i+self.SCENES_PER_REQ] for i in range(0, total, self.SCENES_PER_REQ)]
-        workers  = max(1, len(_api_pool) if _api_pool else 1)
-        done     = 0
+        self._st(f'Step 3 — Sending all {total} scenes in 1 request...')
+        self._pg(p0 + (p1 - p0) * 0.05)
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {pool.submit(self._gen_scene_batch, b, style, char_block): b for b in batches}
-            for fut in as_completed(future_map):
-                if self._stop.is_set():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-                batch = future_map[fut]
-                try:
-                    results = fut.result()
-                    for n, _ in batch:
-                        if n not in results:
-                            results[n] = '[missing]'
-                except Exception as e:
-                    results = {n: f'[error: {e}]' for n, _ in batch}
+        try:
+            results = self._gen_scene_batch(scenes, style, char_block)
+            for n, _ in scenes:
+                if n not in results:
+                    results[n] = '[missing]'
+        except Exception as e:
+            results = {n: f'[error: {e}]' for n, _ in scenes}
 
-                out = ''.join(f'[{n}] {results[n]}\n' for n, _ in sorted(batch, key=lambda x: x[0]))
-                if out:
-                    self._append(self._prompts_box, out)
-                done += len(batch)
-                self._st(f'Step 3 — {done}/{total} scenes done...')
-                self._pg(p0 + (p1 - p0) * (done / total))
-                if done < total and not self._stop.is_set():
-                    time.sleep(1)
-
+        out = ''.join(f'[{n}] {results[n]}\n' for n, _ in sorted(scenes, key=lambda x: x[0]))
+        if out:
+            self._append(self._prompts_box, out)
         self._pg(p1)
 
 
