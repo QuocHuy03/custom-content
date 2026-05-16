@@ -105,7 +105,12 @@ def _find_cookie_files():
         try:
             import json as _json
             data = _json.loads(p.read_text('utf-8'))
-            cookies = [c.strip() for c in data if isinstance(c, str) and c.strip()]
+            # New format: {"cookies": [...], "ua": "..."}
+            if isinstance(data, dict):
+                cookies = [c.strip() for c in data.get('cookies', []) if isinstance(c, str) and c.strip()]
+            else:
+                # Old format: ["cookie1", "cookie2"]
+                cookies = [c.strip() for c in data if isinstance(c, str) and c.strip()]
             if cookies:
                 return cookies
         except Exception:
@@ -118,6 +123,21 @@ def _find_cookie_files():
             if lines:
                 return lines
     return [None]
+
+
+def _load_ua():
+    """Load saved User-Agent string from cookies.json, or return None."""
+    base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    p = base / 'cookies.json'
+    if p.exists():
+        try:
+            import json as _json
+            data = _json.loads(p.read_text('utf-8'))
+            if isinstance(data, dict):
+                return (data.get('ua') or '').strip() or None
+        except Exception:
+            pass
+    return None
 
 
 def _kill_port(port):
@@ -134,6 +154,7 @@ def _kill_port(port):
 
 def _launch_servers(accounts):
     global _server_procs, _api_pool, _api_cycle
+    ua = _load_ua()
     ports = []
     for i, cookie_str in enumerate(accounts):
         port = 6969 + i
@@ -142,6 +163,8 @@ def _launch_servers(accounts):
         env['PORT'] = str(port)
         if cookie_str is not None:
             env['COOKIE_STRING'] = cookie_str
+        if ua:
+            env['GPT_USER_AGENT'] = ua
         cmd = ([sys.executable, '--server'] if getattr(sys, 'frozen', False)
                else [sys.executable, str(_SERVER_SCRIPT)])
         proc = subprocess.Popen(cmd, env=env)
@@ -226,6 +249,11 @@ def _parse_scene_prompts(response):
     if current_num is not None and current_parts:
         result[current_num] = ' '.join(current_parts)
     return result
+
+
+def _chunk_scenes(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def _parse_char_refs_bulk(response):
@@ -692,36 +720,60 @@ class App(QMainWindow):
 
     def _open_settings(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle('Settings — ChatGPT Cookies')
-        dlg.resize(640, 500)
+        dlg.setWindowTitle('Settings — Cookies & User-Agent')
+        dlg.resize(640, 560)
         v = QVBoxLayout(dlg)
         v.setContentsMargins(16, 16, 16, 14)
         v.setSpacing(6)
 
-        lbl = QLabel('ChatGPT Cookies')
+        lbl = QLabel('ChatGPT Cookies & User-Agent')
         lbl.setFont(QFont('Segoe UI', 13, QFont.Bold))
         v.addWidget(lbl)
 
-        hint = QLabel('Mỗi cookie 1 hàng. Lấy từ DevTools → Network → chatgpt.com → Cookie header.')
+        hint = QLabel(
+            'Lấy từ DevTools (F12) → Network → chatgpt.com → bất kỳ request nào → Headers:\n'
+            '• Cookie  →  dán vào ô Cookies bên dưới (mỗi tài khoản 1 hàng)\n'
+            '• User-Agent  →  dán vào ô User-Agent'
+        )
         hint.setStyleSheet('color: #666; font-size: 11px;')
         hint.setWordWrap(True)
         v.addWidget(hint)
 
-        cookie_box = QTextEdit()
-        cookie_box.setFont(QFont('Courier New', 9))
-        cookie_box.setLineWrapMode(QTextEdit.NoWrap)
-        _cj = Path(__file__).parent / 'cookies.json'
-        _cf = Path(__file__).parent / 'cookie.txt'
+        _base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+        _cj = _base / 'cookies.json'
+        _cf = _base / 'cookie.txt'
+
+        # Load existing data
+        _existing_cookies: list[str] = []
+        _existing_ua = ''
         if _cj.exists():
             try:
                 import json as _json
-                _cookies = _json.loads(_cj.read_text('utf-8'))
-                cookie_box.setPlainText('\n'.join(c for c in _cookies if isinstance(c, str)))
+                _data = _json.loads(_cj.read_text('utf-8'))
+                if isinstance(_data, dict):
+                    _existing_cookies = [c for c in _data.get('cookies', []) if isinstance(c, str)]
+                    _existing_ua = (_data.get('ua') or '').strip()
+                else:
+                    _existing_cookies = [c for c in _data if isinstance(c, str)]
             except Exception:
                 pass
         elif _cf.exists():
-            cookie_box.setPlainText(_cf.read_text('utf-8'))
+            _existing_cookies = [l for l in _cf.read_text('utf-8').splitlines() if l.strip()]
+
+        v.addWidget(QLabel('Cookies (mỗi tài khoản 1 hàng):'))
+        cookie_box = QTextEdit()
+        cookie_box.setFont(QFont('Courier New', 9))
+        cookie_box.setLineWrapMode(QTextEdit.NoWrap)
+        cookie_box.setPlainText('\n'.join(_existing_cookies))
         v.addWidget(cookie_box, 1)
+
+        v.addWidget(QLabel('User-Agent:'))
+        ua_edit = QLineEdit()
+        ua_edit.setPlaceholderText(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...'
+        )
+        ua_edit.setText(_existing_ua)
+        v.addWidget(ua_edit)
 
         log_box = QTextEdit()
         log_box.setReadOnly(True)
@@ -746,14 +798,16 @@ class App(QMainWindow):
                 return
             log_box.clear()
             ls.sig.emit(f'Đang kiểm tra {len(lines)} cookie(s)...')
-            ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                  'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+            _ua = ua_edit.text().strip() or (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+            )
             def _worker():
                 for i, cookie in enumerate(lines):
                     try:
                         r = requests.get(
                             'https://chatgpt.com/api/auth/session',
-                            headers={'Cookie': cookie, 'User-Agent': ua, 'Accept': 'application/json'},
+                            headers={'Cookie': cookie, 'User-Agent': _ua, 'Accept': 'application/json'},
                             timeout=15,
                         )
                         if r.status_code == 200:
@@ -776,10 +830,14 @@ class App(QMainWindow):
             if not lines:
                 QMessageBox.warning(dlg, 'Trống', 'Nhập ít nhất 1 cookie.')
                 return
-            _cj.write_text(_json.dumps(lines, ensure_ascii=False, indent=2), encoding='utf-8')
+            ua_val = ua_edit.text().strip()
+            save_data: dict = {'cookies': lines}
+            if ua_val:
+                save_data['ua'] = ua_val
+            _cj.write_text(_json.dumps(save_data, ensure_ascii=False, indent=2), encoding='utf-8')
             _cleanup_servers()
             _launch_servers(_find_cookie_files())
-            ls.sig.emit(f'✓ Đã lưu {len(lines)} cookie(s) vào cookies.json và restart servers.')
+            ls.sig.emit(f'✓ Đã lưu {len(lines)} cookie(s) và restart servers.')
 
         br = QHBoxLayout()
         b_val = QPushButton('Validate')
@@ -1012,6 +1070,46 @@ class App(QMainWindow):
         )
         return _parse_scene_prompts(ask(prompt))
 
+    def _gen_scene_batch_resilient(self, scenes, style, char_block):
+        sizes = [100, 50, 25, 10, 5, 1]
+        last_error = None
+
+        for size in sizes:
+            if len(scenes) <= size:
+                try:
+                    results = self._gen_scene_batch(scenes, style, char_block)
+                    missing = [n for n, _ in scenes if n not in results]
+                    if not missing:
+                        return results
+                    last_error = RuntimeError(
+                        f'missing scenes in response: {", ".join(str(n) for n in missing[:10])}'
+                    )
+                except Exception as e:
+                    last_error = e
+                continue
+
+            merged = {}
+            ok = True
+            for chunk in _chunk_scenes(scenes, size):
+                try:
+                    results = self._gen_scene_batch(chunk, style, char_block)
+                    missing = [n for n, _ in chunk if n not in results]
+                    if missing:
+                        raise RuntimeError(
+                            f'missing scenes in response: {", ".join(str(n) for n in missing[:10])}'
+                        )
+                    merged.update(results)
+                except Exception as e:
+                    last_error = e
+                    ok = False
+                    break
+            if ok:
+                return merged
+
+        if last_error:
+            raise last_error
+        raise RuntimeError('failed to generate scene prompts')
+
     def _run_scene_prompts(self, scenes, p0, p1):
         style   = self._style()
         total   = len(scenes)
@@ -1024,7 +1122,7 @@ class App(QMainWindow):
         self._pg(p0 + (p1 - p0) * 0.05)
 
         try:
-            results = self._gen_scene_batch(scenes, style, char_block)
+            results = self._gen_scene_batch_resilient(scenes, style, char_block)
             for n, _ in scenes:
                 if n not in results:
                     results[n] = '[missing]'

@@ -13,6 +13,7 @@ from chatgpt_plus import ChatGPTPlus
 _PORT          = int(os.environ.get('PORT', 6969))
 _COOKIE_STRING = os.environ.get('COOKIE_STRING') or None
 _COOKIE_FILE   = os.environ.get('COOKIE_FILE')   or None
+_UA_STRING     = os.environ.get('GPT_USER_AGENT') or None
 
 _lock:   asyncio.Lock           = None
 _client: Optional[ChatGPTPlus]  = None
@@ -22,7 +23,7 @@ _client: Optional[ChatGPTPlus]  = None
 async def lifespan(app: FastAPI):
     global _lock, _client
     _lock   = asyncio.Lock()
-    _client = ChatGPTPlus(cookie_string=_COOKIE_STRING, cookie_file=_COOKIE_FILE)
+    _client = ChatGPTPlus(cookie_string=_COOKIE_STRING, cookie_file=_COOKIE_FILE, ua_string=_UA_STRING)
     yield
     if _client:
         await asyncio.to_thread(_client.close)

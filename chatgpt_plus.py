@@ -1,11 +1,15 @@
-import os, asyncio, json
+import os, sys, asyncio, json
 from pathlib import Path
 from dotenv import load_dotenv
 from gpt_plus import GPTPlus
 
-load_dotenv(Path(__file__).parent / '.env', override=False)
+_BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+load_dotenv(_BASE / '.env', override=False)
 
-_BASE = Path(__file__).parent
+_DEFAULT_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+)
 
 
 def _resolve_cookie(cookie_string=None, cookie_file=None):
@@ -40,11 +44,15 @@ def _resolve_cookie(cookie_string=None, cookie_file=None):
 
 
 class ChatGPTPlus:
-    def __init__(self, conv_id=None, cookie_string=None, cookie_file=None, **_):
+    def __init__(self, conv_id=None, cookie_string=None, cookie_file=None, ua_string=None, **_):
         self.conv_id = conv_id
         cookie = _resolve_cookie(cookie_string, cookie_file)
         if cookie:
             os.environ['GPT_COOKIES'] = cookie
+        if ua_string:
+            os.environ['GPT_USER_AGENT'] = ua_string
+        elif not os.environ.get('GPT_USER_AGENT'):
+            os.environ['GPT_USER_AGENT'] = _DEFAULT_UA
         self._gpt = GPTPlus()
 
     def ask(self, message: str) -> str:

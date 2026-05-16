@@ -32,7 +32,8 @@ from pow import solve_pow
 from solver_client import NodeSolver
 from sse_parser import parse_sse, decode_stream, iter_sse_events
 
-load_dotenv(Path(__file__).parent / ".env")
+_BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+load_dotenv(_BASE / ".env")
 logger = logging.getLogger(__name__)
 
 IMPERSONATE = os.getenv("GPT_IMPERSONATE", "chrome131")
